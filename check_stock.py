@@ -2,11 +2,14 @@
 """Lidl stock monitor — checks a product page and pushes a phone
 notification via ntfy.sh when the item becomes orderable.
 
-v3: retries within a run, keeps last-known-good state on failures,
-and only warns after FAIL_THRESHOLD consecutive failed checks
-(4 checks x 30 min = ~2 hours) instead of paging on every hiccup.
+v4: explicitly negotiates gzip and decompresses the response.
+(Without an Accept-Encoding header, Lidl's CDN may send compressed
+bytes that decode as garbage.) Keeps v3 behavior: retries, last-
+known-good state, warning only after FAIL_THRESHOLD consecutive
+failed checks.
 """
 
+import gzip
 import json
 import os
 import re
@@ -14,6 +17,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import zlib
 
 URL = os.environ.get(
     "PRODUCT_URL",
@@ -32,15 +36,45 @@ HEADERS = {
     ),
     "Accept": "text/html,application/xhtml+xml",
     "Accept-Language": "nl-NL,nl;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
+    "Cache-Control": "no-cache",
 }
 
 BLOCK_MARKERS = ("captcha", "access denied", "unusual traffic", "robot", "akamai")
 
 
+def decode_body(raw: bytes, content_encoding: str) -> str:
+    """Decompress (if needed) and decode a response body."""
+    if raw[:2] == b"\x1f\x8b":  # gzip magic bytes
+        try:
+            raw = gzip.decompress(raw)
+        except OSError as exc:
+            print(f"  gzip decompress failed: {exc}", file=sys.stderr)
+    elif "deflate" in content_encoding:
+        try:
+            raw = zlib.decompress(raw)
+        except zlib.error:
+            try:
+                raw = zlib.decompress(raw, -zlib.MAX_WBITS)
+            except zlib.error as exc:
+                print(f"  deflate decompress failed: {exc}", file=sys.stderr)
+    return raw.decode("utf-8", errors="replace")
+
+
 def fetch(url: str) -> str:
     req = urllib.request.Request(url, headers=HEADERS)
     with urllib.request.urlopen(req, timeout=30) as resp:
-        return resp.read().decode("utf-8", errors="replace")
+        raw = resp.read()
+        encoding = (resp.headers.get("Content-Encoding") or "").lower()
+    print(f"  content-encoding: {encoding or 'none'}, {len(raw)} raw bytes")
+    return decode_body(raw, encoding)
+
+
+def garble_ratio(text: str) -> float:
+    """Fraction of unicode replacement chars — high means binary junk."""
+    if not text:
+        return 1.0
+    return text.count("\ufffd") / len(text)
 
 
 def check_availability(html: str) -> str:
@@ -100,7 +134,9 @@ def get_status() -> str:
             print(f"attempt {attempt}: {exc}", file=sys.stderr)
         else:
             status = check_availability(html)
-            print(f"attempt {attempt}: parsed {status} (html {len(html)} chars)")
+            ratio = garble_ratio(html)
+            print(f"attempt {attempt}: parsed {status} "
+                  f"(html {len(html)} chars, garble {ratio:.1%})")
             if status == "UNKNOWN":
                 snippet = re.sub(r"\s+", " ", html[:300])
                 blocked = any(m in html.lower() for m in BLOCK_MARKERS)
